@@ -137,6 +137,10 @@ model User {
   slackWebhookUrl String?       // Slack incoming-webhook URL for notification alerts (#277)
   discordWebhookUrl String?     // Discord incoming-webhook URL for notification alerts (#278)
   batchWindowSeconds Int        @default(60) // notification batching window in seconds (#279)
+  // Email change flow (#356): pending new address + HMAC token cleared after confirmation
+  pendingEmail               String?
+  emailChangeToken           String?  @unique
+  emailChangeTokenExpiresAt  DateTime?
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
@@ -169,6 +173,8 @@ model User {
   recruiterFavorites   FavoriteRecruiter[]      @relation("RecruiterFavorites")
   companyMembers       CompanyMember[]          @relation("CompanyOwner")
   memberOfCompanies    CompanyMember[]          @relation("MemberUser")
+  recoveryCodes        RecoveryCode[]
+  trustedDevices       TrustedDevice[]
 
   @@index([role, deactivatedAt])
   @@index([deletedAt, anonymizedAt]) // Used by PiiAnonymizationSchedulerService
@@ -799,4 +805,43 @@ model FeatureFlag {
   updatedAt   DateTime @updatedAt
 
   @@map("feature_flags")
+}
+
+// Two-step company ownership transfer (#360).
+// The current owner initiates; the proposed new owner must accept within 7 days.
+// Acceptance atomically reassigns CompanyMember roles and writes an AuditLog entry.
+model OwnershipTransfer {
+  id          String    @id @default(uuid())
+  companyId   String                // the User.id of the company owner record
+  fromOwnerId String                // current owner's User.id
+  toMemberId  String                // proposed new owner's User.id (must be a CompanyMember)
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([companyId])
+  @@index([toMemberId])
+  @@map("ownership_transfers")
+}
+
+// A device that has been trusted after a successful 2FA login.
+// While the record is active (revokedAt null, expiresAt in the future) the device
+// can skip 2FA on subsequent logins.  The raw token is shown once to the client;
+// only the SHA-256 hash is stored.
+model TrustedDevice {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique // SHA-256 of the raw trusted-device token
+  name       String?           // optional human-readable label (e.g. browser user-agent)
+  lastUsedAt DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("trusted_devices")
 }
