@@ -10,7 +10,13 @@ import {
 } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { Prisma, SecurityEventAction, User, UserRole } from "@prisma/client";
+import {
+  Prisma,
+  RefreshToken,
+  SecurityEventAction,
+  User,
+  UserRole,
+} from "@prisma/client";
 import {
   randomBytes,
   scrypt as scryptCallback,
@@ -31,6 +37,7 @@ import { Keypair } from "@stellar/stellar-sdk";
 const scrypt = promisify(scryptCallback);
 const PASSWORD_KEY_LENGTH = 64;
 const REFRESH_TOKEN_DAYS = 7;
+const DEFAULT_IDLE_SESSION_WINDOW_DAYS = 7;
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MINUTES = 15;
 const IMPERSONATION_TOKEN_TTL_SECONDS = 5 * 60;
@@ -443,6 +450,12 @@ export class AuthService {
       throw new UnauthorizedException("Refresh token is no longer valid");
     }
 
+    if (this.isSessionIdle(stored, now)) {
+      throw new UnauthorizedException(
+        "Session has expired due to inactivity",
+      );
+    }
+
     const nextRefreshToken = await this.signRefreshToken(
       stored.user,
       stored.familyId,
@@ -453,7 +466,7 @@ export class AuthService {
     await this.prisma.$transaction(async (tx) => {
       const consumed = await tx.refreshToken.updateMany({
         where: { id: stored.id, consumedAt: null, revokedAt: null },
-        data: { consumedAt: now },
+        data: { consumedAt: now, lastUsedAt: now },
       });
 
       if (consumed.count !== 1) {
@@ -470,6 +483,7 @@ export class AuthService {
           tokenHash: nextRefreshTokenHash,
           familyId: stored.familyId,
           expiresAt: nextExpiresAt,
+          lastUsedAt: now,
         },
       });
     });
@@ -652,6 +666,7 @@ export class AuthService {
       familyId: session.familyId,
       createdAt: session.createdAt,
       expiresAt: session.expiresAt,
+      lastUsedAt: session.lastUsedAt,
       isCurrent: session.consumedAt === null,
     }));
   }
@@ -1096,6 +1111,7 @@ export class AuthService {
         tokenHash: this.hashRefreshToken(refreshToken),
         familyId,
         expiresAt: this.refreshExpiryDate(),
+        lastUsedAt: new Date(),
       },
     });
 
@@ -1135,6 +1151,26 @@ export class AuthService {
       REFRESH_TOKEN_DAYS,
     );
     return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  }
+
+  /**
+   * True when a session has seen no activity (no refresh) for longer than the
+   * configured idle window. Legacy tokens without a recorded lastUsedAt are
+   * measured from their creation date.
+   */
+  private isSessionIdle(
+    token: Pick<RefreshToken, "lastUsedAt" | "createdAt">,
+    now: Date,
+  ): boolean {
+    const idleWindowDays = this.config.get<number>(
+      "IDLE_SESSION_WINDOW_DAYS",
+      DEFAULT_IDLE_SESSION_WINDOW_DAYS,
+    );
+    const lastActivity = token.lastUsedAt ?? token.createdAt;
+    const idleCutoff = new Date(
+      now.getTime() - idleWindowDays * 24 * 60 * 60 * 1000,
+    );
+    return lastActivity < idleCutoff;
   }
 
   private hashRefreshToken(token: string): string {
