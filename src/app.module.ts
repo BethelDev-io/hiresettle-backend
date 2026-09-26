@@ -17,6 +17,7 @@ import { DataRetentionModule } from './common/retention/data-retention.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { S3Module } from './common/s3/s3.module';
 import { PasswordPolicyModule } from './common/password/password-policy.module';
+import { HibpModule } from './common/hibp/hibp.module';
 import { StellarModule as CommonStellarModule } from './common/stellar/stellar.module';
 import { StellarModule } from './modules/stellar/stellar.module';
 
@@ -32,6 +33,7 @@ import { HealthModule } from './modules/health/health.module';
 import { AdminModule } from './modules/admin/admin.module';
 import { BillingModule } from './modules/billing/billing.module';
 import { TeamInvitesModule } from './modules/team-invites/team-invites.module';
+import { CompaniesModule } from './modules/companies/companies.module';
 import { GraphqlModule } from './graphql/graphql.module';
 import stellarConfig from './config/stellar.config';
 import { MaintenanceModeModule } from './common/maintenance/maintenance-mode.module';
@@ -68,6 +70,7 @@ import { DevModule } from './modules/dev/dev.module';
     PrismaModule,
     S3Module,
     PasswordPolicyModule,
+    HibpModule,
     CommonStellarModule,
     StellarModule,
     ...(process.env.NODE_ENV === 'production' || process.env.STELLAR_NETWORK === 'mainnet' ? [] : [DevModule]),
@@ -83,6 +86,7 @@ import { DevModule } from './modules/dev/dev.module';
     AdminModule,
     BillingModule,
     TeamInvitesModule,
+    CompaniesModule,
     GraphqlModule,
     FeatureFlagsModule,
   ],

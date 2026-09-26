@@ -23,6 +23,7 @@ import { PrismaService } from "../../common/prisma/prisma.service";
 import { StellarService } from "../../common/stellar/stellar.service";
 import { SecurityEventsService } from "../../common/security-events/security-events.service";
 import { PasswordPolicyService } from "../../common/password/password-policy.service";
+import { HibpService } from "../../common/hibp/hibp.service";
 import { LoginDto } from "./dto/login.dto";
 import { RegisterDto } from "./dto/register.dto";
 import { Keypair } from "@stellar/stellar-sdk";
@@ -52,6 +53,11 @@ export class AuthService {
   >();
   private readonly regChallenges = new Map<string, string>(); // keyed by userId
   private readonly authChallenges = new Map<string, string>();
+  // Rebind challenges keyed by userId (#357)
+  private readonly rebindChallenges = new Map<
+    string,
+    { nonce: string; expiresAt: number }
+  >();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -60,6 +66,7 @@ export class AuthService {
     private readonly stellar: StellarService,
     private readonly securityEvents: SecurityEventsService,
     private readonly passwordPolicy: PasswordPolicyService,
+    private readonly hibp: HibpService,
   ) {}
 
   generateNonce(stellarAddress: string): string {
@@ -84,8 +91,41 @@ export class AuthService {
     return true;
   }
 
+  // ── Issue #357 — rebind challenge helpers ──────────────────────────────────
+
+  /**
+   * Generate a 10-minute challenge nonce scoped to a userId.
+   * Used for the Stellar wallet rebinding flow so the nonce is tied to the
+   * authenticated user rather than an address (which is changing).
+   */
+  generateRebindChallenge(userId: string): string {
+    const nonce = `hiresettle-rebind:${userId}:${Date.now()}:${randomBytes(16).toString('hex')}`;
+    this.rebindChallenges.set(userId, {
+      nonce,
+      expiresAt: Date.now() + 10 * 60 * 1000, // 10 min TTL
+    });
+    return nonce;
+  }
+
+  /**
+   * Validate and consume a rebind challenge nonce.
+   * Returns true on success; false if not found, expired, or mismatched.
+   */
+  consumeRebindChallenge(userId: string, nonce: string): boolean {
+    const entry = this.rebindChallenges.get(userId);
+    if (!entry) return false;
+    if (entry.expiresAt < Date.now()) {
+      this.rebindChallenges.delete(userId);
+      return false;
+    }
+    if (entry.nonce !== nonce) return false;
+    this.rebindChallenges.delete(userId);
+    return true;
+  }
+
   async register(dto: RegisterDto) {
     this.passwordPolicy.validate(dto.password);
+    await this.checkHibp(dto.password);
     const email = dto.email.toLowerCase();
     const passwordHash = await this.hashPassword(dto.password);
 
@@ -176,16 +216,31 @@ export class AuthService {
 
     // Check if 2FA is enabled
     if (user.totpEnabled) {
-      if (!dto.totpCode) {
-        throw new UnauthorizedException(
-          "TOTP code required for 2FA-enabled account",
-        );
-      }
+      // Check for a valid trusted-device token first — if present and valid, skip 2FA
+      const trustedDeviceSkip =
+        dto.trustedDeviceToken &&
+        (await this.verifyTrustedDeviceToken(user.id, dto.trustedDeviceToken));
 
-      const isValid = this.verifyTotpCode(user.totpSecret!, dto.totpCode);
-      if (!isValid) {
-        await this.handleFailedLogin(user.id, meta);
-        throw new UnauthorizedException("Invalid TOTP code");
+      if (!trustedDeviceSkip) {
+        if (!dto.totpCode && !dto.recoveryCode) {
+          throw new UnauthorizedException(
+            "TOTP code or recovery code required for 2FA-enabled account",
+          );
+        }
+
+        if (dto.recoveryCode) {
+          const consumed = await this.consumeRecoveryCode(user.id, dto.recoveryCode);
+          if (!consumed) {
+            await this.handleFailedLogin(user.id, meta);
+            throw new UnauthorizedException("Invalid or already-used recovery code");
+          }
+        } else {
+          const isValid = this.verifyTotpCode(user.totpSecret!, dto.totpCode!);
+          if (!isValid) {
+            await this.handleFailedLogin(user.id, meta);
+            throw new UnauthorizedException("Invalid TOTP code");
+          }
+        }
       }
     }
 
@@ -196,7 +251,19 @@ export class AuthService {
       user.id,
       meta,
     );
-    return this.issueTokenPair(user);
+
+    const tokenPair = await this.issueTokenPair(user);
+
+    // If the user asked to trust this device after a successful 2FA, issue a token
+    if (user.totpEnabled && dto.trustDevice) {
+      const trustedDeviceToken = await this.issueTrustedDeviceToken(
+        user.id,
+        meta.userAgent,
+      );
+      return { ...tokenPair, trustedDeviceToken };
+    }
+
+    return tokenPair;
   }
 
   // Backward-compatible alias kept for existing controller routes
@@ -507,6 +574,68 @@ export class AuthService {
     return webhookSecret ? { ...safeUser, webhookSecret } : safeUser;
   }
 
+  /**
+   * Returns the authenticated user's own security events from the last 90 days.
+   * Covers all event types (login success/failure, logout, password reset, etc.)
+   * so the user can review recent account activity.
+   */
+  async getLoginHistory(
+    userId: string,
+    page: number = 1,
+    limit: number = 20,
+  ) {
+    const HISTORY_WINDOW_DAYS = 90;
+    const from = new Date(
+      Date.now() - HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+    );
+
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.securityEvent.findMany({
+        where: {
+          userId,
+          createdAt: { gte: from },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+        select: {
+          id: true,
+          action: true,
+          ip: true,
+          userAgent: true,
+          createdAt: true,
+        },
+      }),
+      this.prisma.securityEvent.count({
+        where: {
+          userId,
+          createdAt: { gte: from },
+        },
+      }),
+    ]);
+
+    // Derive success/failure flag from the action name so clients don't need
+    // to interpret SecurityEventAction values themselves.
+    const events = data.map((e) => ({
+      id: e.id,
+      action: e.action,
+      success: e.action !== SecurityEventAction.LOGIN_FAILURE,
+      ip: e.ip ?? null,
+      userAgent: e.userAgent ?? null,
+      createdAt: e.createdAt,
+    }));
+
+    return {
+      data: events,
+      meta: {
+        total,
+        page,
+        limit,
+        windowDays: HISTORY_WINDOW_DAYS,
+      },
+    };
+  }
+
   async getSessions(userId: string) {
     const now = new Date();
     const sessions = await this.prisma.refreshToken.findMany({
@@ -650,8 +779,10 @@ export class AuthService {
       data: { totpEnabled: true },
     });
 
+    const recoveryCodes = await this.createRecoveryCodes(userId);
+
     this.logger.log(`2FA enabled for user: ${user.email || userId}`);
-    return { enabled: true };
+    return { enabled: true, recoveryCodes };
   }
 
   async disableTotp(userId: string, code: string) {
@@ -679,6 +810,268 @@ export class AuthService {
 
     this.logger.log(`2FA disabled for user: ${user.email || userId}`);
     return { disabled: true };
+  }
+
+  /**
+   * Regenerate backup recovery codes for a 2FA-enabled account.
+   * Requires a valid TOTP code to prevent misuse.
+   * All previous codes are invalidated before new ones are issued.
+   */
+  async regenerateRecoveryCodes(userId: string, totpCode: string): Promise<{ recoveryCodes: string[] }> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new BadRequestException("User not found");
+    if (!user.totpEnabled) throw new BadRequestException("2FA is not enabled");
+
+    const isValid = this.verifyTotpCode(user.totpSecret!, totpCode);
+    if (!isValid) throw new UnauthorizedException("Invalid TOTP code");
+
+    const recoveryCodes = await this.createRecoveryCodes(userId);
+    this.logger.log(`Recovery codes regenerated for user: ${user.email || userId}`);
+    return { recoveryCodes };
+  }
+
+  // ── HaveIBeenPwned breach check ───────────────────────────────────────────
+
+  /**
+   * Rejects passwords that appear in the HaveIBeenPwned corpus.
+   *
+   * Behaviour:
+   *  - If HIBP_CHECK_ENABLED=false the check is skipped entirely.
+   *  - If the API is unreachable an error is logged and the check is skipped
+   *    (fail-open) so a network hiccup never blocks registrations.
+   *  - If the password is found it throws BadRequestException with a clear message.
+   */
+  private async checkHibp(password: string): Promise<void> {
+    const enabled = this.config.get<string>('HIBP_CHECK_ENABLED', 'true');
+    if (enabled === 'false' || enabled === '0') {
+      return;
+    }
+
+    let breached: boolean;
+    try {
+      breached = await this.hibp.isBreached(password);
+    } catch (err: any) {
+      // isBreached already logs API errors and returns false; this is a
+      // belt-and-suspenders catch for truly unexpected failures.
+      this.logger.warn(`HIBP check failed unexpectedly: ${err?.message ?? err} — skipping`);
+      return;
+    }
+
+    if (breached) {
+      throw new BadRequestException(
+        'This password has appeared in a known data breach. Please choose a different password.',
+      );
+    }
+  }
+
+  // ── Trusted Devices ──────────────────────────────────────────────────────
+
+  /**
+   * Issue a trusted-device token after a successful 2FA login.
+   * The raw token is returned once; only its SHA-256 hash is stored.
+   */
+  async issueTrustedDeviceToken(
+    userId: string,
+    userAgent?: string,
+  ): Promise<string> {
+    const ttlDays = this.config.get<number>("TRUSTED_DEVICE_TTL_DAYS", 30);
+    const rawToken = randomBytes(32).toString("hex");
+    const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+    const expiresAt = new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+
+    // Use first 120 chars of userAgent as the device label for display
+    const name = userAgent ? userAgent.slice(0, 120) : undefined;
+
+    await this.prisma.trustedDevice.create({
+      data: { userId, tokenHash, name, expiresAt },
+    });
+
+    return rawToken;
+  }
+
+  /**
+   * Verify a trusted-device token. Returns true if the token is valid,
+   * not revoked, and not expired — updating lastUsedAt in the process.
+   */
+  async verifyTrustedDeviceToken(
+    userId: string,
+    rawToken: string,
+  ): Promise<boolean> {
+    const tokenHash = createHash("sha256").update(rawToken).digest("hex");
+    const now = new Date();
+
+    const device = await this.prisma.trustedDevice.findUnique({
+      where: { tokenHash },
+    });
+
+    if (
+      !device ||
+      device.userId !== userId ||
+      device.revokedAt !== null ||
+      device.expiresAt <= now
+    ) {
+      return false;
+    }
+
+    // Bump lastUsedAt — non-blocking
+    await this.prisma.trustedDevice
+      .update({ where: { id: device.id }, data: { lastUsedAt: now } })
+      .catch(() => undefined);
+
+    return true;
+  }
+
+  /**
+   * List active (non-revoked, non-expired) trusted devices for a user.
+   */
+  async listTrustedDevices(userId: string) {
+    const now = new Date();
+    return this.prisma.trustedDevice.findMany({
+      where: { userId, revokedAt: null, expiresAt: { gt: now } },
+      orderBy: { lastUsedAt: "desc" },
+      select: {
+        id: true,
+        name: true,
+        lastUsedAt: true,
+        expiresAt: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  /**
+   * Revoke a single trusted device. Users can only revoke their own.
+   */
+  async revokeTrustedDevice(deviceId: string, userId: string) {
+    const device = await this.prisma.trustedDevice.findUnique({
+      where: { id: deviceId },
+    });
+
+    if (!device) {
+      throw new BadRequestException("Trusted device not found");
+    }
+
+    if (device.userId !== userId) {
+      throw new ForbiddenException(
+        "You can only revoke your own trusted devices",
+      );
+    }
+
+    if (device.revokedAt) {
+      throw new BadRequestException("Trusted device already revoked");
+    }
+
+    await this.prisma.trustedDevice.update({
+      where: { id: deviceId },
+      data: { revokedAt: new Date() },
+    });
+
+    return { revoked: true };
+  }
+
+  /**
+   * Revoke ALL trusted devices for a user — called after a password change.
+   */
+  private async revokeAllTrustedDevices(userId: string): Promise<void> {
+    await this.prisma.trustedDevice.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  // ── Password Reset ────────────────────────────────────────────────────────
+
+  /**
+   * Change the authenticated user's password.
+   * Verifies the current password, enforces the complexity policy, and
+   * revokes all trusted devices to invalidate any stolen session on device-
+   * trust re-login.
+   */
+  async resetPassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+  ) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || !user.passwordHash) {
+      throw new BadRequestException(
+        "User not found or password login not available",
+      );
+    }
+
+    const currentValid = await this.verifyPassword(
+      currentPassword,
+      user.passwordHash,
+    );
+    if (!currentValid) {
+      throw new UnauthorizedException("Current password is incorrect");
+    }
+
+    this.passwordPolicy.validate(newPassword);
+    await this.checkHibp(newPassword);
+
+    const newHash = await this.hashPassword(newPassword);
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash: newHash },
+    });
+
+    // Revoke all trusted devices — after a password change the previous
+    // device-trust relationship should no longer bypass 2FA.
+    await this.revokeAllTrustedDevices(userId);
+
+    this.logger.log(`Password changed for user: ${userId}`);
+    return { updated: true };
+  }
+
+  /** Generate 10 fresh codes, delete all previous ones, store hashes, return plain-text. */
+  private async createRecoveryCodes(userId: string): Promise<string[]> {
+    const RECOVERY_CODE_COUNT = 10;
+    const codes: string[] = [];
+
+    for (let i = 0; i < RECOVERY_CODE_COUNT; i++) {
+      // Format: XXXXX-XXXXX (10 hex chars split by a dash — easy to type)
+      const raw = randomBytes(5).toString("hex").toUpperCase() +
+                  "-" +
+                  randomBytes(5).toString("hex").toUpperCase();
+      codes.push(raw);
+    }
+
+    const codeHashes = codes.map((c) => ({
+      userId,
+      codeHash: createHash("sha256").update(c).digest("hex"),
+    }));
+
+    await this.prisma.$transaction([
+      // Invalidate all existing codes for this user
+      this.prisma.recoveryCode.deleteMany({ where: { userId } }),
+      // Insert the new hashed codes
+      this.prisma.recoveryCode.createMany({ data: codeHashes }),
+    ]);
+
+    return codes;
+  }
+
+  /**
+   * Look up a recovery code by hash, mark it as used if found and unused.
+   * Returns true if the code was valid and consumed, false otherwise.
+   */
+  private async consumeRecoveryCode(userId: string, rawCode: string): Promise<boolean> {
+    const codeHash = createHash("sha256").update(rawCode.trim().toUpperCase()).digest("hex");
+
+    const record = await this.prisma.recoveryCode.findFirst({
+      where: { userId, codeHash, usedAt: null },
+    });
+
+    if (!record) return false;
+
+    await this.prisma.recoveryCode.update({
+      where: { id: record.id },
+      data: { usedAt: new Date() },
+    });
+
+    return true;
   }
 
   private verifyTotpCode(secret: string, code: string): boolean {
