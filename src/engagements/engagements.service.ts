@@ -6,6 +6,25 @@ import { Milestone } from './entities/milestone.entity';
 import { CreateEngagementDto } from './dto/create-engagement.dto';
 import { UpdateEngagementDto } from './dto/update-engagement.dto';
 
+export type ActivityType =
+  | 'audit'
+  | 'milestone'
+  | 'note'
+  | 'chain';
+
+export interface ActivityItem {
+  id: string;
+  type: ActivityType;
+  timestamp: string;
+  visibility: 'internal' | 'company';
+  data: Record<string, any>;
+}
+
+export interface ActivityFeed {
+  items: ActivityItem[];
+  nextCursor: string | null;
+}
+
 @Injectable()
 export class EngagementsService {
   constructor(
@@ -80,5 +99,93 @@ export class EngagementsService {
     }
 
     return saved;
+  }
+
+  async getActivity(
+    id: string,
+    options: { cursor?: string; limit?: number; isCompany?: boolean } = {},
+  ): Promise<ActivityFeed> {
+    const engagement = await this.findOne(id);
+    const limit = Math.min(Math.max(options.limit ?? 20, 1), 100);
+
+    const items: ActivityItem[] = [];
+
+    // Audit log entries
+    const auditLog = (engagement as any).auditLog ?? [];
+    for (const entry of auditLog) {
+      items.push({
+        id: `audit:${entry.id}`,
+        type: 'audit',
+        timestamp: new Date(entry.createdAt ?? entry.timestamp).toISOString(),
+        visibility: entry.visibility ?? 'company',
+        data: entry,
+      });
+    }
+
+    // Milestone history
+    for (const milestone of engagement.milestones ?? []) {
+      items.push({
+        id: `milestone:${milestone.id}`,
+        type: 'milestone',
+        timestamp: new Date(
+          (milestone as any).updatedAt ??
+            (milestone as any).createdAt ??
+            Date.now(),
+        ).toISOString(),
+        visibility: 'company',
+        data: milestone,
+      });
+    }
+
+    // Notes
+    const notes = (engagement as any).notes ?? [];
+    for (const note of notes) {
+      items.push({
+        id: `note:${note.id}`,
+        type: 'note',
+        timestamp: new Date(note.createdAt ?? note.timestamp).toISOString(),
+        visibility: note.visibility ?? 'internal',
+        data: note,
+      });
+    }
+
+    // Chain events
+    const chainEvents = (engagement as any).chainEvents ?? [];
+    for (const event of chainEvents) {
+      items.push({
+        id: `chain:${event.id}`,
+        type: 'chain',
+        timestamp: new Date(event.createdAt ?? event.timestamp).toISOString(),
+        visibility: 'company',
+        data: event,
+      });
+    }
+
+    // Respect visibility: internal notes only for company
+    const visible = options.isCompany
+      ? items
+      : items.filter((item) => item.visibility !== 'internal');
+
+    // Sort by time descending across all merged sources
+    visible.sort(
+      (a, b) =>
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+    );
+
+    // Cursor pagination
+    let startIndex = 0;
+    if (options.cursor) {
+      const decoded = Buffer.from(options.cursor, 'base64').toString('utf8');
+      const cursorIndex = visible.findIndex((item) => item.id === decoded);
+      startIndex = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+    }
+
+    const page = visible.slice(startIndex, startIndex + limit);
+    const hasMore = startIndex + limit < visible.length;
+    const nextCursor = hasMore
+      ? Buffer.from(page[page.length - 1].id, 'utf8').toString('base64')
+      : null;
+
+    return { items: page, nextCursor };
   }
 }
