@@ -25,6 +25,13 @@ export interface ActivityFeed {
   nextCursor: string | null;
 }
 
+export interface FindAllOptions {
+  q?: string;
+  status?: EngagementStatus;
+  limit?: number;
+  offset?: number;
+}
+
 @Injectable()
 export class EngagementsService {
   constructor(
@@ -42,10 +49,47 @@ export class EngagementsService {
     return this.engagementRepository.save(engagement);
   }
 
-  async findAll(): Promise<Engagement[]> {
-    return this.engagementRepository.find({
-      relations: ['milestones'],
-    });
+  async findAll(options: FindAllOptions = {}): Promise<Engagement[]> {
+    const { q, status, limit, offset } = options;
+
+    // No search term: preserve existing basic filtering/pagination behavior.
+    if (!q || !q.trim()) {
+      return this.engagementRepository.find({
+        where: status ? { status } : undefined,
+        relations: ['milestones'],
+        ...(limit !== undefined ? { take: limit } : {}),
+        ...(offset !== undefined ? { skip: offset } : {}),
+      });
+    }
+
+    // Ranked full-text search over the generated tsvector column
+    // (title + description + tags), backed by a GIN index.
+    const queryBuilder = this.engagementRepository
+      .createQueryBuilder('engagement')
+      .leftJoinAndSelect('engagement.milestones', 'milestone')
+      .where(
+        'engagement.search_vector @@ plainto_tsquery(\'english\', :q)',
+        { q: q.trim() },
+      )
+      .orderBy(
+        'ts_rank(engagement.search_vector, plainto_tsquery(\'english\', :q))',
+        'DESC',
+      )
+      .setParameter('q', q.trim());
+
+    if (status) {
+      queryBuilder.andWhere('engagement.status = :status', { status });
+    }
+
+    if (limit !== undefined) {
+      queryBuilder.take(limit);
+    }
+
+    if (offset !== undefined) {
+      queryBuilder.skip(offset);
+    }
+
+    return queryBuilder.getMany();
   }
 
   async findOne(id: string): Promise<Engagement> {
